@@ -85,11 +85,19 @@ All user-owned tables carry `user_id` with RLS scoping rows to `auth.uid()`.
   `target_sets`, `target_reps`, `rest_seconds` nullable) — optional. Presence of rows makes
   a day **fixed**; absence makes it **templated**. See "Program Model" below.
 - **`sessions`** (`id`, `user_id`, `program_day_id` nullable — null means ad hoc,
-  `equipment_profile_id`, `date`, `status`).
-- **`session_exercises`** (`id`, `session_id`, `exercise_id`, `order`, `target_sets`,
-  `target_reps`, `rest_seconds`) — the concrete plan for one session, populated either by
-  the rule engine (templated days, ad hoc sessions) or copied from `program_day_exercises`
-  (fixed days).
+  `equipment_profile_id`, `date`, `status` enum(`active`/`completed`/`abandoned`)). A
+  session is only created when the user starts a workout (there is no pre-materialized
+  "planned" row for a future scheduled day) — it starts `active`, and ends either
+  `completed` or `abandoned`. Future streak/adherence logic counts `completed` sessions
+  against the program's `days_per_week`, not against pre-planned rows.
+- **`session_exercises`** (`id` — **client-generated UUID**, `session_id`, `exercise_id`,
+  `order`, `target_sets`, `target_reps`, `rest_seconds`) — the concrete plan for one
+  session, populated either by the rule engine (templated days, ad hoc sessions) or copied
+  from `program_day_exercises` (fixed days). All `session_exercises` rows use
+  client-generated UUIDs, not just ones created by an offline swap — since generation
+  itself runs on-device (see Generation Engine), this keeps the ID scheme uniform rather
+  than branching on origin, and gives swap the same idempotent-replay property as `sets`
+  (see Offline Architecture).
 - **`sets`** (`id` — **client-generated UUID**, `session_exercise_id`, `set_number`,
   `weight`, `reps`, `completed_at`, `is_pr`). See Offline Architecture for why the UUID
   matters.
@@ -163,13 +171,18 @@ requirement, not a compute one.
 - Rest timer auto-starts after each logged set, duration from `session_exercises.rest_seconds`
   (itself either the parsed import value or the goal template's default).
 - Previous performance for an exercise is shown from the most recent prior `sets` for that
-  `exercise_id` + user.
+  `exercise_id` + user, served from the local performance cache offline (see Offline
+  Architecture) — this is a mid-workout "know what to beat" feature and can't depend on a
+  live query.
 - Swap re-runs a narrowed version of the generation filter (same muscle group/movement
   pattern, current equipment) locally, instantly — no backend round trip, online or offline.
 - **PR detection**: a set's estimated 1RM (Epley formula: `weight × (1 + reps/30)`) is
-  compared against the user's best prior e1RM for that exercise. If a set is later edited
-  or deleted, `is_pr` is recomputed for that exercise — this is documented behavior (the
-  flag is derived, denormalized data that can go stale on edit/delete), not a bug.
+  compared against the user's best prior e1RM for that exercise. `is_pr` is authoritatively
+  computed in Postgres via a trigger function on `sets` writes (insert/update/delete) —
+  keeping recomputation-on-edit/delete entirely in the database rather than becoming an ad
+  hoc Fastify responsibility, since Fastify has no other reason to touch `sets` at all.
+  This is documented behavior (the flag is derived, denormalized data that's expected to be
+  recomputed on edit/delete), not a bug.
 
 ## Offline Architecture
 
@@ -180,22 +193,25 @@ new `session` row to Supabase is a sync operation — the generation *computatio
 already runs on-device (see Generation Engine), so this is a data-write constraint, not a
 capability gap.
 
-- **Local queue**: active-workout writes (`sets`, in-session swaps) are held in a local
-  SQLite store and synced to Supabase on reconnect.
-- **Sync model — idempotent replay, not conflict resolution**: `sets.id` is a
-  client-generated UUID, and set creation is append-only. Combined with the
-  single-device-per-session assumption, this means sync conflicts aren't just rare — they're
-  structurally impossible for creates: replaying the same insert twice is a no-op upsert by
-  UUID. (Edits/deletes of past sets are expected to be rare and are queued the same way —
-  idempotent by UUID.) This also simplifies what the sync tests need to prove:
-  replay-twice-equals-same-state, not conflict-resolution correctness.
-- **PR detection offline**: the PR check needs "this user's best prior e1RM per exercise,"
-  which can't depend on whatever history happens to have synced. The mobile app maintains a
-  small local cache table — one row per exercise the user has ever logged, holding its best
-  known e1RM — refreshed from the server (source of truth, computed from `sets`) on every
-  sync and consulted at log time for the instant offline PR check. If an edge case
-  misfires offline (e.g. a not-yet-synced better set elsewhere), it self-corrects on the
-  next sync since the server recompute remains authoritative.
+- **Local queue**: active-workout writes (`sets`, `session_exercises` from swaps) are held
+  in a local SQLite store and synced to Supabase on reconnect.
+- **Sync model — idempotent replay, not conflict resolution**: `sets.id` and
+  `session_exercises.id` are both client-generated UUIDs, and creation of either is
+  append-only. Combined with the single-device-per-session assumption, this means sync
+  conflicts aren't just rare — they're structurally impossible for creates: replaying the
+  same insert twice is a no-op upsert by UUID. (Edits/deletes of past sets are expected to
+  be rare and are queued the same way — idempotent by UUID.) This also simplifies what the
+  sync tests need to prove: replay-twice-equals-same-state, not conflict-resolution
+  correctness.
+- **Local exercise performance cache**: both PR detection and previous-performance display
+  need per-exercise history that can't depend on whatever's happened to sync. The mobile app
+  maintains a small local cache table — one row per exercise the user has ever logged,
+  holding its best known e1RM *and* its most recent session's per-set performance
+  (weight × reps) — refreshed from Postgres (source of truth; see PR detection below) on
+  every sync and consulted at log time for both the instant offline PR check and the
+  "know what to beat" previous-performance display. If an edge case misfires offline (e.g. a
+  not-yet-synced better set elsewhere), it self-corrects on the next sync since Postgres
+  remains authoritative.
 
 ## Import Flow
 
@@ -207,17 +223,25 @@ capability gap.
    and per-day exercise lines (name, sets, reps, rest if stated).
 4. **Matching step**: for each extracted line, the backend asks the LLM to pick the best
    match from candidate library exercises (filtered by inferable muscle group) or flag it
-   as unmatched. Every line ends up with a real `exercise_id` — matched, or newly created
-   with `source: 'import'`, `user_id: owner`. This is the parser's contract: no line is
-   ever dropped or left unresolved. The full resolved result, including any parsed
-   `rest_seconds`, is written to `imports.parsed_draft` — nothing touches `programs` yet.
+   as unmatched. Every line resolves to one of two things, both written into
+   `imports.parsed_draft` only — **no domain table is touched at parse time**:
+   - a real `exercise_id`, if matched, or
+   - a **fully-specified draft exercise** (name, muscles, inferred equipment — everything
+     needed to create the row later) for unmatched lines.
+   This is the parser's contract: no line is ever dropped or left unresolved, but "resolved"
+   means "resolved within the draft," not "written to `exercises`." The full result,
+   including any parsed `rest_seconds`, lives entirely in `parsed_draft` until confirm.
 5. Mobile app renders a **review screen** from `parsed_draft`: per day, per exercise,
-   showing the match with the ability to pick a different library exercise or confirm it's
-   genuinely new, plus parsed sets/reps/rest.
-6. On confirm, the backend materializes `parsed_draft` into real `programs` /
-   `program_days` / `program_day_exercises` rows and sets `imports.created_program_id`. On
-   discard, the `imports` row is marked discarded; nothing was ever written to the domain
-   tables.
+   showing the match (with the ability to pick a different library exercise) or the draft
+   exercise (with the ability to edit it or confirm it's genuinely new), plus parsed
+   sets/reps/rest.
+6. On confirm, the backend runs a single transaction that creates any draft exercises as
+   real `exercises` rows (`source: 'import'`, `user_id: owner`), then materializes
+   `parsed_draft` into `programs` / `program_days` / `program_day_exercises` rows
+   (referencing the newly created exercise IDs alongside any already-matched ones), and
+   sets `imports.created_program_id`. On discard, the `imports` row is marked discarded;
+   because nothing was ever written outside `parsed_draft`, there is nothing to roll back —
+   discard can never leave orphaned exercise rows behind.
 7. Failure handling: a parse failure (bad scan, unsupported content) sets `status: 'failed'`
    with a message and a manual-program-creation fallback. A partial parse (one day garbled)
    still reaches the review screen so the user can fix or delete just that day, rather than
@@ -249,8 +273,8 @@ capability gap.
 - Import/LLM failures: `status: 'failed'` with retry + manual fallback (see Import Flow).
 - Fastify auth failures: missing/invalid/expired JWT → 401 before any handler logic runs.
 - Offline sync: idempotent replay means there is no conflict-resolution error case to
-  handle for `sets` creation under the single-device-per-session assumption (see Offline
-  Architecture).
+  handle for `sets` or `session_exercises` creation under the single-device-per-session
+  assumption (see Offline Architecture).
 
 ## Testing Strategy
 
@@ -259,7 +283,13 @@ capability gap.
   session" property), and goal templates. Since the engine is a shared package, this one
   suite covers both its call sites (mobile now; backend if ever reintroduced).
 - **Import matching**: unit tests against fixture LLM responses (mocked), plus one
-  integration test against a real sample PDF.
+  integration test against a real sample PDF. Includes a discard-leaves-no-trace test —
+  confirming a discarded import has zero rows in `exercises`/`programs`/`program_days`/
+  `program_day_exercises` — and a confirm-is-transactional test (partial failure during
+  materialization rolls back the draft exercises too, not just the program rows).
+- **PR trigger**: a Postgres-level test (or one run against a local Supabase instance)
+  confirming `is_pr` recomputes correctly on set insert, edit, and delete for the affected
+  exercise.
 - **RLS policies**: integration tests proving cross-user data isolation — the core
   guarantee the multi-user-from-day-one schema exists to provide.
 - **Offline sync**: tests for the queue → reconnect → sync path, specifically
