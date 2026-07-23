@@ -89,7 +89,9 @@ All user-owned tables carry `user_id` with RLS scoping rows to `auth.uid()`.
   session is only created when the user starts a workout (there is no pre-materialized
   "planned" row for a future scheduled day) — it starts `active`, and ends either
   `completed` or `abandoned`. Future streak/adherence logic counts `completed` sessions
-  against the program's `days_per_week`, not against pre-planned rows.
+  against the program's `days_per_week`, not against pre-planned rows. Sets already logged
+  in an `abandoned` session still count for history and PR detection — you did lift the
+  weight, and the PR trigger fires on set insert regardless of session status.
 - **`session_exercises`** (`id` — **client-generated UUID**, `session_id`, `exercise_id`,
   `order`, `target_sets`, `target_reps`, `rest_seconds`) — the concrete plan for one
   session, populated either by the rule engine (templated days, ad hoc sessions) or copied
@@ -177,12 +179,16 @@ requirement, not a compute one.
 - Swap re-runs a narrowed version of the generation filter (same muscle group/movement
   pattern, current equipment) locally, instantly — no backend round trip, online or offline.
 - **PR detection**: a set's estimated 1RM (Epley formula: `weight × (1 + reps/30)`) is
-  compared against the user's best prior e1RM for that exercise. `is_pr` is authoritatively
-  computed in Postgres via a trigger function on `sets` writes (insert/update/delete) —
-  keeping recomputation-on-edit/delete entirely in the database rather than becoming an ad
-  hoc Fastify responsibility, since Fastify has no other reason to touch `sets` at all.
-  This is documented behavior (the flag is derived, denormalized data that's expected to be
-  recomputed on edit/delete), not a bug.
+  compared against the user's best prior e1RM for that exercise — but **only for sets of
+  ≤12 reps**. Epley degrades badly at high rep counts (a 20kg × 20 endurance set implies a
+  ~33kg "1RM"), which would let endurance-goal users farm meaningless PRs on every light
+  set. Sets above 12 reps get no `is_pr` flag in v1; a separate "rep PR" (most reps at a
+  given weight) is a plausible future addition for that range but isn't built now. `is_pr`
+  is authoritatively computed in Postgres via a trigger function on `sets` writes
+  (insert/update/delete) — keeping recomputation-on-edit/delete, and the rep-count guard,
+  entirely in the database rather than becoming an ad hoc Fastify responsibility, since
+  Fastify has no other reason to touch `sets` at all. This is documented behavior (the flag
+  is derived, denormalized data that's expected to be recomputed on edit/delete), not a bug.
 
 ## Offline Architecture
 
@@ -289,7 +295,8 @@ capability gap.
   materialization rolls back the draft exercises too, not just the program rows).
 - **PR trigger**: a Postgres-level test (or one run against a local Supabase instance)
   confirming `is_pr` recomputes correctly on set insert, edit, and delete for the affected
-  exercise.
+  exercise, and specifically that a high-rep set (>12 reps, e.g. 20kg × 20) never gets
+  flagged as a PR regardless of its numeric e1RM.
 - **RLS policies**: integration tests proving cross-user data isolation — the core
   guarantee the multi-user-from-day-one schema exists to provide.
 - **Offline sync**: tests for the queue → reconnect → sync path, specifically
