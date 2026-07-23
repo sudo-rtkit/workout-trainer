@@ -36,13 +36,13 @@ select ok(
   'lighter second set is not flagged as a PR'
 );
 
--- Set 3: 20kg x 20 (endurance range) -> numerically huge e1RM, must NEVER be a PR.
+-- Set 3: 50kg x 50 (high-rep endurance set) -> raw e1RM 133.3 (exceeds current PR 116.7), must NEVER be a PR due to >12-rep guard.
 insert into sets (id, session_exercise_id, set_number, weight, reps, completed_at)
-values ('cccccccc-0000-0000-0000-000000000007'::uuid, 'cccccccc-0000-0000-0000-000000000004'::uuid, 3, 20, 20, now() + interval '2 minutes');
+values ('cccccccc-0000-0000-0000-000000000007'::uuid, 'cccccccc-0000-0000-0000-000000000004'::uuid, 3, 50, 50, now() + interval '2 minutes');
 
 select ok(
   not (select is_pr from sets where id = 'cccccccc-0000-0000-0000-000000000007'::uuid),
-  'high-rep set (20 reps) is never flagged as a PR regardless of numeric e1RM'
+  'high-rep set (50 reps, raw e1RM 133.3 > current PR 116.7) is never flagged as a PR — the >12-rep guard overrides a numerically higher e1RM'
 );
 
 -- Deleting the original PR set should retroactively promote the 90kg x5 set to PR.
