@@ -38,3 +38,6 @@ begin
   perform set_config('role', 'postgres', true);
 end;
 $$;
+
+grant usage on schema tests to public;
+grant execute on all functions in schema tests to public;
