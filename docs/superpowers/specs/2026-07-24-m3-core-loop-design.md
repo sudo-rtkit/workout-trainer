@@ -152,6 +152,25 @@ returns the ranked list.
   password hash (`crypt('<dev-password>', gen_salt('bf'))` via pgcrypto — not the fake
   placeholder hash `tests.create_test_user` uses, which only works for RLS-simulation
   tests that set the JWT claim directly, not real `signInWithPassword` calls).
+- **`signInWithPassword` has more prerequisites than a password hash — a raw `auth.users`
+  insert that misses any of these fails in ways that look unrelated to auth.** The seed
+  must set, in `auth.users`:
+  - `instance_id = '00000000-0000-0000-0000-000000000000'` (GoTrue's default instance).
+  - `email_confirmed_at` to a non-null timestamp — `NULL` here yields an "email not
+    confirmed" sign-in failure even with local email-confirmation disabled.
+  - `aud = 'authenticated'`, `role = 'authenticated'`.
+
+  and additionally insert a matching row into **`auth.identities`** — GoTrue does not
+  authenticate a user with zero identity rows regardless of `auth.users` state — with
+  `provider = 'email'`, `provider_id` equal to the user's id, and `identity_data`
+  containing at least `sub` (the user id) and `email`.
+- **Verification gate, ordered right after the seed task, before any screen task starts:**
+  a small script (or a `curl` against the local GoTrue endpoint) that runs
+  `supabase db reset` then calls `signInWithPassword` with the seeded credentials and
+  asserts success. This exists specifically so a broken dev-user seed fails loudly at the
+  seed task, not as "why is my equipment list empty" three layers later in
+  `EquipmentSetupScreen` — the exact compounding-failure shape the per-screen manual
+  checkpoints (see Testing Strategy) exist to prevent.
 - The mobile app's root bootstrap, gated behind a dev flag (e.g. `__DEV__` or an explicit
   `EXPO_PUBLIC_DEV_AUTO_SIGNIN` env var), calls
   `supabase.auth.signInWithPassword({ email, password })` with the matching hardcoded dev
@@ -163,6 +182,34 @@ returns the ranked list.
 - M7 (real auth) later replaces the auto-sign-in call with an actual login form — additive,
   not a rework, since every screen and hook already only ever sees "the current
   authenticated user," never a hardcoded ID.
+- `seed.sql` carries a header comment: `-- local dev seed — never run against a hosted
+  project` (hardcoded dev credentials are fine for a local-only seed file; the comment is a
+  guard for M7's future self, who will be touching real auth config in the same vicinity).
+
+## Dev-Loop Reset Orchestration
+
+`supabase db reset` alone is no longer sufficient once M3 screens depend on real data:
+`equipment_catalog`/`exercises` are empty until `scripts/seed-exercises.ts` runs, and
+`movement_pattern`/`is_compound` tags are gone until `scripts/apply-movement-tags.ts`
+re-applies the committed, human-reviewed `scripts/data/movement-tags-review.json` — but
+`EquipmentSetupScreen` needs the catalog and `GenerateScreen` needs a (tagged, ideally)
+library on every dev-loop reset.
+
+Add a root script, `pnpm run db:reset`, that runs in order:
+
+1. `supabase db reset` — migrations + `seed.sql` (dev user).
+2. `tsx scripts/seed-exercises.ts` — populates `equipment_catalog`/`exercises`.
+3. `tsx scripts/apply-movement-tags.ts` — re-applies `movement-tags-review.json` **if that
+   file exists**; if it doesn't (Task 14's live tagging + human review hasn't happened yet),
+   skip this step with a warning rather than failing the whole reset — the sentinel
+   fallback in `toEngineExercise` means the app functions correctly untagged (just with
+   degraded movement-pattern dedup quality), so an incomplete tagging pass must never block
+   the dev loop.
+
+This becomes the documented reset path (replacing bare `supabase db reset` in any
+onboarding/README instructions), and it's what makes committing the reviewed tagging file
+(a decision made during the M0–M2 cleanup batch) actually pay off — otherwise a fresh reset
+would silently discard the reviewed tags with no automatic path back.
 
 ## Error Handling
 
